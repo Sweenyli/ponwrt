@@ -1,0 +1,128 @@
+name: Build PonWrt Firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Choose SoC (chip model)'
+        required: true
+        type: choice
+        default: an7581
+        options:
+          - an7581
+          - an7583
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ponwrt-build-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ inputs.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      TZ: Etc/UTC
+      TARGET: ${{ inputs.target }}
+
+    steps:
+      - name: Checkout PonWrt source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          echo 'Disk space before cleanup:'
+          df -h .
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          echo 'Disk space after cleanup:'
+          df -h .
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3 python3-dev \
+            python3-setuptools python3-ply python3-docutils \
+            python3-pyelftools rsync unzip zlib1g-dev file wget curl \
+            autoconf automake autopoint bc binutils ccache cmake cpio \
+            device-tree-compiler help2man libelf-dev libtool ninja-build \
+            pkgconf qemu-utils squashfs-tools subversion swig texinfo \
+            time xxd zip zstd
+
+      - name: Cache downloaded source archives
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: ponwrt-dl-${{ runner.os }}-${{ hashFiles('feeds.conf.default') }}-v1
+
+      - name: Update and install feeds
+        shell: bash
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Apply target configuration
+        shell: bash
+        run: |
+          test -f "configs/${TARGET}.config"
+          cp "configs/${TARGET}.config" .config
+          make defconfig
+          echo "Selected target: ${TARGET}"
+          grep -E '^CONFIG_TARGET_airoha_an758[13]=y$' .config
+
+      - name: Download build sources
+        shell: bash
+        run: |
+          make download -j2
+          df -h .
+
+      - name: Compile firmware
+        shell: bash
+        run: |
+          set -o pipefail
+          make -j3 2>&1 | tee build.log
+
+      - name: Check firmware output
+        shell: bash
+        run: |
+          outdir="bin/targets/airoha/${TARGET}"
+          test -d "$outdir"
+          find "$outdir" -maxdepth 1 -type f \
+            \( -name '*.bin' -o -name '*.itb' -o -name '*.ubi' \
+               -o -name '*.img' -o -name '*.tar.gz' \) | grep -q .
+          cp .config "$outdir/final.config"
+          echo "Firmware files in $outdir:"
+          ls -lh "$outdir"
+
+      - name: Upload compiled firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: PonWrt-${{ inputs.target }}-${{ github.run_number }}
+          path: bin/targets/airoha/${{ inputs.target }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload build log if failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PonWrt-build-log-${{ inputs.target }}-${{ github.run_number }}
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Show disk usage
+        if: always()
